@@ -108,6 +108,31 @@ class Diffusion(nn.Module):
         model_mean, posterior_variance, posterior_log_variance = self.q_posterior(x_start=x_recon, x_t=x, t=t)
         return model_mean, posterior_variance, posterior_log_variance
 
+    def select_action_softmax_topk(self, action, q, topk=8, tau=1.0):
+        """
+        action: [B, K, act_dim]
+        q:      [B, K, 1] or [B, K]
+        return: [B, act_dim]
+        """
+        if q.dim() == 3:
+            q2d = q.squeeze(-1)          # [B, K]
+        else:
+            q2d = q                      # [B, K]
+
+        K = q2d.shape[1]
+        topk = min(topk, K)
+
+        # top-k
+        q_top, idx_top = torch.topk(q2d, k=topk, dim=1)  # q_top: [B, topk], idx_top: [B, topk]
+        a_top = action.gather(dim=1, index=idx_top.unsqueeze(-1).repeat(1, 1, self.action_dim))  # [B, topk, act_dim]
+
+        # softmax sampling within top-k
+        probs = torch.softmax(q_top / tau, dim=1)        # [B, topk]
+        j = torch.multinomial(probs, num_samples=1)      # [B, 1]
+
+        picked = a_top.gather(dim=1, index=j.unsqueeze(-1).repeat(1, 1, self.action_dim)).squeeze(1)  # [B, act_dim]
+        return picked
+
     @torch.no_grad()
     def p_sample(self, x, t, s):
         b, *_, device = *x.shape, x.device
@@ -159,8 +184,11 @@ class Diffusion(nn.Module):
             q = torch.min(q1, q2)
             action = action.view(self.eval_sample, raw_batch_size, -1).transpose(0,1)
             q = q.view(self.eval_sample, raw_batch_size, -1).transpose(0,1)
-            action_idx = torch.argmax(q, dim=1, keepdim=True).repeat(1,1,self.action_dim)
-            return action.gather(dim=1, index=action_idx).view(raw_batch_size, -1)
+            # action_idx = torch.argmax(q, dim=1, keepdim=True).repeat(1,1,self.action_dim)
+            # return action.gather(dim=1, index=action_idx).view(raw_batch_size, -1)
+            topk = 64
+            tau = 0.2
+            return self.select_action_softmax_topk(action, q, topk=topk, tau=tau)
         else:
             raw_batch_size = state.shape[0]
             state = state.repeat(self.behavior_sample, 1)
@@ -172,8 +200,11 @@ class Diffusion(nn.Module):
             q = torch.min(q1, q2)
             action = action.view(self.behavior_sample, raw_batch_size, -1).transpose(0,1)
             q = q.view(self.behavior_sample, raw_batch_size, -1).transpose(0,1)
-            action_idx = torch.argmax(q, dim=1, keepdim=True).repeat(1,1,self.action_dim)
-            return action.gather(dim=1, index=action_idx).view(raw_batch_size, -1)
+            # action_idx = torch.argmax(q, dim=1, keepdim=True).repeat(1,1,self.action_dim)
+            # return action.gather(dim=1, index=action_idx).view(raw_batch_size, -1)
+            topk = 4
+            tau = 0.8
+            return self.select_action_softmax_topk(action, q, topk=topk, tau=tau)
 
     # ------------------------------------------ training ------------------------------------------#
     @torch.no_grad()

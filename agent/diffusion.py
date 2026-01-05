@@ -134,28 +134,26 @@ class Diffusion(nn.Module):
         return picked
 
     @torch.no_grad()
-    def p_sample(self, x, t, s):
+    def p_sample(self, x, t, s, noise_ratio=None):
         b, *_, device = *x.shape, x.device
 
         model_mean, _, model_log_variance = self.p_mean_variance(x=x, t=t, s=s)
-
         noise = torch.randn_like(x)
-        # no noise when t == 0
         nonzero_mask = (1 - (t == 0).float()).reshape(b, *((1,) * (len(x.shape) - 1)))
 
-        return model_mean + nonzero_mask * (0.5 * model_log_variance).exp() * noise * self.noise_ratio
+        nr = self.noise_ratio if noise_ratio is None else noise_ratio
+        return model_mean + nonzero_mask * (0.5 * model_log_variance).exp() * noise * nr
 
 
     @torch.no_grad()
-    def p_sample_loop(self, state, shape):
+    def p_sample_loop(self, state, shape, noise_ratio=None):
         device = self.betas.device
-
         batch_size = shape[0]
         x = torch.randn(shape, device=device)
 
         for i in reversed(range(0, self.n_timesteps)):
             timesteps = torch.full((batch_size,), i, device=device, dtype=torch.long)
-            x = self.p_sample(x, timesteps, state)
+            x = self.p_sample(x, timesteps, state, noise_ratio=noise_ratio)
 
         return x
 
@@ -166,10 +164,30 @@ class Diffusion(nn.Module):
         else:
             self.noise_ratio = self.max_noise_ratio
 
+        if (q_func is not None) and (not eval):
+            B = state.shape[0]
+            M = 8  # probe 次数
+            probe_states = state.repeat(M, 1)
+            probe_actions = torch.empty(M * B, self.action_dim, device=state.device).uniform_(-1, 1)
+            q1, q2 = q_func(probe_states, probe_actions)
+            q = torch.min(q1, q2).view(M, B, 1)  # [M,B,1]
+            q_std = q.std(dim=0)                 # [B,1]
+
+            # 将 std 映射到 [noise_min, noise_max], std 越大，noise 越小
+            noise_min = 0.1
+            noise_max = self.max_noise_ratio
+            scale = 1.0 / (1.0 + q_std)
+            noise_ratio = noise_min + (noise_max - noise_min) * scale  # [B,1]
+        else:
+            noise_ratio = None
+
         if normal:
             batch_size = state.shape[0]
             shape = (batch_size, self.action_dim)
-            action = self.p_sample_loop(state, shape)
+            repeat_k = self.behavior_sample   # Kb
+            if noise_ratio is not None:
+                noise_ratio = noise_ratio.repeat(repeat_k, 1)
+            action = self.p_sample_loop(state, shape, noise_ratio=noise_ratio)
             action.clamp_(-1., 1.)
             return action
 
@@ -178,7 +196,10 @@ class Diffusion(nn.Module):
             state = state.repeat(self.eval_sample, 1)
             batch_size = state.shape[0]
             shape = (batch_size, self.action_dim)
-            action = self.p_sample_loop(state, shape)
+            repeat_k = self.eval_sample       # Ke
+            if noise_ratio is not None:
+                noise_ratio = noise_ratio.repeat(repeat_k, 1)
+            action = self.p_sample_loop(state, shape, noise_ratio=noise_ratio)
             action.clamp_(-1., 1.)
             q1, q2 = q_func(state, action)
             q = torch.min(q1, q2)
@@ -194,7 +215,10 @@ class Diffusion(nn.Module):
             state = state.repeat(self.behavior_sample, 1)
             batch_size = state.shape[0]
             shape = (batch_size, self.action_dim)
-            action = self.p_sample_loop(state, shape)
+            repeat_k = self.behavior_sample   # Kb
+            if noise_ratio is not None:
+                noise_ratio = noise_ratio.repeat(repeat_k, 1)
+            action = self.p_sample_loop(state, shape, noise_ratio=noise_ratio)
             action.clamp_(-1., 1.)
             q1, q2 = q_func(state, action)
             q = torch.min(q1, q2)
